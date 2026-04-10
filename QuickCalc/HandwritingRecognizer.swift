@@ -34,10 +34,10 @@ struct HandwritingRecognizer {
             throw HandwritingRecognitionError.emptyDrawing
         }
 
-        let candidates = try await Self.uniMERNetCandidates(from: normalizedStrokes, canvasSize: canvasSize)
+        let candidates = try await Self.recognitionCandidates(from: normalizedStrokes, canvasSize: canvasSize)
 
-        for candidate in candidates where Self.isEvaluatable(candidate) {
-            return candidate
+        if let candidate = candidates.first {
+            return candidate.expression
         }
 
         throw HandwritingRecognitionError.noTextFound
@@ -48,21 +48,51 @@ struct HandwritingRecognizer {
     }
 
     nonisolated static func normalizedUniMERNetOutputForTesting(_ text: String) -> String {
-        normalizeUniMERNetOutput(text)
+        ExpressionSanitizer.bestExpression(from: text)
     }
 
-    private static func uniMERNetCandidates(from strokes: [Stroke], canvasSize: CGSize) async throws -> [String] {
+    private static func recognitionCandidates(from strokes: [Stroke], canvasSize: CGSize) async throws -> [ExpressionCandidate] {
         let images = try makeImages(from: strokes, canvasSize: canvasSize)
-        var candidates: [String] = []
+        var allCandidates: [ExpressionCandidate] = []
+        var modelError: Error?
+
+        do {
+            allCandidates.append(contentsOf: try await uniMERNetCandidates(from: images))
+        } catch {
+            modelError = error
+        }
+
+        if allCandidates.isEmpty {
+            let visionCandidates = await VisionExpressionRecognizer().recognizeCandidates(from: images)
+            allCandidates.append(contentsOf: visionCandidates)
+        }
+
+        let unique = ExpressionSanitizer.uniqueCandidates(allCandidates)
+        if unique.isEmpty == false {
+            return unique
+        }
+
+        if let modelError {
+            throw modelError
+        }
+
+        throw HandwritingRecognitionError.noTextFound
+    }
+
+    private static func uniMERNetCandidates(from images: [CGImage]) async throws -> [ExpressionCandidate] {
+        var candidates: [ExpressionCandidate] = []
         var firstError: Error?
 
-        for image in images {
+        for (index, image) in images.enumerated() {
             do {
                 let rawOutput = try await recognizeWithUniMERNet(image)
-                let normalized = normalizeUniMERNetOutput(rawOutput)
-                if normalized.isEmpty == false {
-                    candidates.append(normalized)
-                }
+                candidates.append(
+                    contentsOf: ExpressionSanitizer.candidates(
+                        from: rawOutput,
+                        baseScore: 1_000 - (index * 25),
+                        source: "unimernet"
+                    )
+                )
             } catch {
                 if firstError == nil {
                     firstError = error
@@ -70,7 +100,7 @@ struct HandwritingRecognizer {
             }
         }
 
-        let unique = uniqueCandidates(candidates)
+        let unique = ExpressionSanitizer.uniqueCandidates(candidates)
         if unique.isEmpty == false {
             return unique
         }
@@ -216,86 +246,6 @@ struct HandwritingRecognizer {
         )
     }
 
-    nonisolated private static func normalizeUniMERNetOutput(_ text: String) -> String {
-        let fractionExpanded = expandFractions(in: text)
-        let cleaned = fractionExpanded
-            .replacingOccurrences(of: "\\left", with: "")
-            .replacingOccurrences(of: "\\right", with: "")
-            .replacingOccurrences(of: "\\times", with: "*")
-            .replacingOccurrences(of: "\\cdot", with: "*")
-            .replacingOccurrences(of: "\\div", with: "/")
-            .replacingOccurrences(of: "\\,", with: "")
-            .replacingOccurrences(of: "\\!", with: "")
-            .replacingOccurrences(of: "$", with: "")
-            .replacingOccurrences(of: "{", with: "")
-            .replacingOccurrences(of: "}", with: "")
-
-        return normalize(cleaned)
-    }
-
-    nonisolated private static func expandFractions(in text: String) -> String {
-        guard let regex = try? NSRegularExpression(
-            pattern: #"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}"#,
-            options: []
-        ) else {
-            return text
-        }
-
-        var expanded = text
-
-        while true {
-            let fullRange = NSRange(expanded.startIndex..<expanded.endIndex, in: expanded)
-            guard let match = regex.firstMatch(in: expanded, options: [], range: fullRange),
-                  let numeratorRange = Range(match.range(at: 1), in: expanded),
-                  let denominatorRange = Range(match.range(at: 2), in: expanded),
-                  let matchRange = Range(match.range(at: 0), in: expanded) else {
-                break
-            }
-
-            let numerator = String(expanded[numeratorRange])
-            let denominator = String(expanded[denominatorRange])
-            expanded.replaceSubrange(matchRange, with: "(\(numerator))/(\(denominator))")
-        }
-
-        return expanded
-    }
-
-    nonisolated private static func normalize(_ text: String) -> String {
-        var normalized = text
-            .replacingOccurrences(of: " ", with: "")
-            .replacingOccurrences(of: "\n", with: "")
-            .replacingOccurrences(of: "×", with: "*")
-            .replacingOccurrences(of: "x", with: "*")
-            .replacingOccurrences(of: "X", with: "*")
-            .replacingOccurrences(of: "÷", with: "/")
-            .replacingOccurrences(of: ":", with: "/")
-            .replacingOccurrences(of: "—", with: "-")
-            .replacingOccurrences(of: "–", with: "-")
-            .replacingOccurrences(of: "−", with: "-")
-            .replacingOccurrences(of: ",", with: ".")
-            .replacingOccurrences(of: "O", with: "0")
-            .replacingOccurrences(of: "o", with: "0")
-            .replacingOccurrences(of: "I", with: "1")
-            .replacingOccurrences(of: "l", with: "1")
-            .replacingOccurrences(of: "|", with: "1")
-            .replacingOccurrences(of: "S", with: "5")
-            .replacingOccurrences(of: "s", with: "5")
-            .replacingOccurrences(of: "B", with: "8")
-            .replacingOccurrences(of: "Z", with: "2")
-            .replacingOccurrences(of: "z", with: "2")
-            .replacingOccurrences(of: "q", with: "9")
-            .replacingOccurrences(of: "g", with: "9")
-            .replacingOccurrences(of: "T", with: "7")
-            .replacingOccurrences(of: "_", with: "-")
-
-        if let equalsIndex = normalized.firstIndex(of: "=") {
-            normalized = String(normalized[..<equalsIndex])
-        }
-
-        normalized = normalized.filter { "0123456789+-*/().".contains($0) }
-        return normalized
-    }
-
     nonisolated private static func flattenWritingAngle(in strokes: [Stroke]) -> [Stroke] {
         let anchors = strokes.compactMap(strokeAnchor(for:))
         guard anchors.count >= 2 else { return strokes }
@@ -377,18 +327,6 @@ struct HandwritingRecognizer {
         }
     }
 
-    nonisolated private static func isEvaluatable(_ text: String) -> Bool {
-        guard text.isEmpty == false else { return false }
-        return (try? ExpressionEvaluator.evaluate(text)) != nil
-    }
-
-    nonisolated private static func uniqueCandidates(_ values: [String]) -> [String] {
-        var seen = Set<String>()
-
-        return values.filter { candidate in
-            candidate.isEmpty == false && seen.insert(candidate).inserted
-        }
-    }
 }
 
 private struct RenderConfiguration: Sendable {
@@ -423,6 +361,14 @@ private struct RenderConfiguration: Sendable {
             lineWidthMultiplier: 14,
             minimumLineWidth: 20,
             maximumAspectRatio: 4.6
+        ),
+        RenderConfiguration(
+            renderWidth: 1200,
+            minimumHeight: 420,
+            padding: 28,
+            lineWidthMultiplier: 8,
+            minimumLineWidth: 12,
+            maximumAspectRatio: 8.5
         )
     ]
 }

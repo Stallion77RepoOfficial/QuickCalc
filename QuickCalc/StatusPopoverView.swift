@@ -8,7 +8,7 @@
 import SwiftUI
 
 struct StatusPopoverView: View {
-    @ObservedObject var model: AppModel
+    let presentation: AppModel.StatusPresentation
     let onClose: () -> Void
 
     var body: some View {
@@ -28,7 +28,8 @@ struct StatusPopoverView: View {
 
     @ViewBuilder
     private var content: some View {
-        if model.isProcessing {
+        switch presentation.content {
+        case .loading:
             HStack {
                 Spacer()
                 ProgressView()
@@ -36,28 +37,28 @@ struct StatusPopoverView: View {
                 Spacer()
             }
             .padding(.vertical, 8)
-        } else if let errorMessage = model.errorMessage {
+        case let .error(errorMessage):
             Text(errorMessage)
                 .font(.system(size: 13, weight: .medium, design: .rounded))
                 .foregroundStyle(.red)
                 .fixedSize(horizontal: false, vertical: true)
-        } else if !model.lastResult.isEmpty {
+        case let .result(expression, value):
             VStack(alignment: .leading, spacing: 8) {
-                if !model.lastExpression.isEmpty {
-                    Text(model.lastExpression)
+                if !expression.isEmpty {
+                    Text(expression)
                         .font(.system(size: 14, weight: .medium, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
                 }
 
-                Text(model.lastResult)
+                Text(value)
                     .font(.system(size: 38, weight: .bold, design: .rounded))
                     .foregroundStyle(Color(red: 0.1, green: 0.35, blue: 0.78))
                     .lineLimit(1)
                     .minimumScaleFactor(0.45)
             }
-        } else {
+        case .empty:
             EmptyView()
         }
     }

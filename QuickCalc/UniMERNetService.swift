@@ -19,7 +19,7 @@ enum UniMERNetServiceError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .pythonMissing:
-            return "Python 3.11 was not found."
+            return "A supported Python 3 runtime was not found."
         case .bootstrapScriptMissing:
             return "The AI bootstrap script is missing."
         case .workerMissing:
@@ -37,9 +37,20 @@ enum UniMERNetServiceError: LocalizedError {
 actor UniMERNetService {
     static let shared = UniMERNetService()
 
-    private enum WorkerDevice: String {
+    private enum WorkerDevice: String, CaseIterable {
         case mps
         case cpu
+    }
+
+    private enum ModelVariant: String, CaseIterable {
+        case base
+        case small
+        case tiny
+    }
+
+    private struct WorkerConfiguration: Equatable, Sendable {
+        let variant: ModelVariant
+        let device: WorkerDevice
     }
 
     private struct WorkerRequest: Encodable {
@@ -70,7 +81,6 @@ actor UniMERNetService {
         let ok: Bool
         let latex: String?
         let errorCode: String?
-        let device: String?
 
         enum CodingKeys: String, CodingKey {
             case type
@@ -78,7 +88,6 @@ actor UniMERNetService {
             case ok
             case latex
             case errorCode = "error_code"
-            case device
         }
     }
 
@@ -91,11 +100,33 @@ actor UniMERNetService {
         let modelDirectoryURL: URL
     }
 
+    private struct PythonVersion: Comparable {
+        let major: Int
+        let minor: Int
+        let patch: Int
+
+        static func < (lhs: PythonVersion, rhs: PythonVersion) -> Bool {
+            if lhs.major != rhs.major {
+                return lhs.major < rhs.major
+            }
+
+            if lhs.minor != rhs.minor {
+                return lhs.minor < rhs.minor
+            }
+
+            return lhs.patch < rhs.patch
+        }
+
+        var isSupported: Bool {
+            major == 3 && minor >= 10
+        }
+    }
+
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let fileManager = FileManager.default
 
-    private var bootstrapState: BootstrapState?
+    private var bootstrapStates: [ModelVariant: BootstrapState] = [:]
     private var process: Process?
     private var standardInput: FileHandle?
     private var stdoutBuffer = Data()
@@ -103,9 +134,9 @@ actor UniMERNetService {
     private var startupContinuation: CheckedContinuation<Void, Error>?
     private var queuedStartupResult: Result<Void, Error>?
     private var preparationTask: Task<Void, Error>?
-    private var currentDevice: WorkerDevice?
+    private var currentConfiguration: WorkerConfiguration?
     private var hasSuccessfulInference = false
-    private var didFallbackToCPU = false
+    private var quarantinedDevices: Set<WorkerDevice> = []
 
     func prewarm() async {
         do {
@@ -123,21 +154,36 @@ actor UniMERNetService {
             hasSuccessfulInference = true
             return latex
         } catch {
-            guard shouldRetryOnCPU(after: error) else {
+            guard let currentConfiguration, shouldAttemptFallback(after: error, from: currentConfiguration) else {
                 throw sanitize(error)
             }
 
-            didFallbackToCPU = true
-            await logInternal("switching_to_cpu_after_first_failure", to: paths.bootstrapLogURL)
-            try await restartWorker(on: .cpu)
-
-            do {
-                let latex = try await sendRequest(imageURL: imageURL)
-                hasSuccessfulInference = true
-                return latex
-            } catch {
-                throw sanitize(error)
+            if currentConfiguration.device == .mps {
+                await quarantineDevice(.mps, reason: "runtime_failure: \(error.localizedDescription)")
             }
+
+            var lastError = error
+
+            for fallbackConfiguration in fallbackConfigurations(after: currentConfiguration) {
+                do {
+                    await logInternal(
+                        "retrying_with_\(fallbackConfiguration.variant.rawValue)_\(fallbackConfiguration.device.rawValue)",
+                        to: paths.bootstrapLogURL
+                    )
+
+                    try await restartWorker(with: fallbackConfiguration)
+                    let latex = try await sendRequest(imageURL: imageURL)
+                    hasSuccessfulInference = true
+                    return latex
+                } catch {
+                    if fallbackConfiguration.device == .mps {
+                        await quarantineDevice(.mps, reason: "fallback_failure: \(error.localizedDescription)")
+                    }
+                    lastError = error
+                }
+            }
+
+            throw sanitize(lastError)
         }
     }
 
@@ -163,34 +209,42 @@ actor UniMERNetService {
     }
 
     private func prepareWorker() async throws {
-        _ = try bootstrapRuntime()
-        let preferredDevice = Self.preferredStartupDevice(environment: ProcessInfo.processInfo.environment)
+        let startupPlans = availableStartupPlans()
 
-        do {
-            try await startWorker(device: preferredDevice)
-        } catch {
-            guard preferredDevice == .mps, shouldRetryOnCPU(afterStartup: error) else {
-                throw sanitize(error)
+        var lastError: Error?
+
+        for configuration in startupPlans {
+            do {
+                try await startWorker(with: configuration)
+                return
+            } catch {
+                if configuration.device == .mps {
+                    await quarantineDevice(.mps, reason: "startup_failure: \(error.localizedDescription)")
+                }
+                lastError = error
+                await logInternal(
+                    "startup_failed[\(configuration.variant.rawValue)-\(configuration.device.rawValue)]: \(error.localizedDescription)",
+                    to: paths.bootstrapLogURL
+                )
             }
-
-            didFallbackToCPU = true
-            await logInternal("mps_start_failed_retrying_cpu", to: paths.bootstrapLogURL)
-            try await startWorker(device: .cpu)
         }
+
+        throw sanitize(lastError ?? UniMERNetServiceError.workerStartupFailed(details: "no_configuration_succeeded"))
     }
 
-    private func restartWorker(on device: WorkerDevice) async throws {
+    private func restartWorker(with configuration: WorkerConfiguration) async throws {
         shutdownWorker()
-        try await startWorker(device: device)
+        try await startWorker(with: configuration)
     }
 
-    private func startWorker(device: WorkerDevice) async throws {
-        let bootstrapState = try bootstrapRuntime()
+    private func startWorker(with configuration: WorkerConfiguration) async throws {
+        let bootstrapState = try bootstrapRuntime(for: configuration.variant)
         guard fileManager.fileExists(atPath: paths.workerURL.path) else {
             throw UniMERNetServiceError.workerMissing(paths.workerURL)
         }
 
         try fileManager.createDirectory(at: paths.logsURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: paths.appSupportURL, withIntermediateDirectories: true)
 
         let process = Process()
         let inputPipe = Pipe()
@@ -204,11 +258,11 @@ actor UniMERNetService {
             "--model-dir",
             bootstrapState.modelDirectoryURL.path,
             "--device",
-            device.rawValue,
+            configuration.device.rawValue,
             "--log-file",
             paths.workerLogURL.path
         ]
-        process.currentDirectoryURL = paths.projectRootURL
+        process.currentDirectoryURL = paths.appSupportURL
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
@@ -237,7 +291,7 @@ actor UniMERNetService {
         pending.removeAll()
         queuedStartupResult = nil
         hasSuccessfulInference = false
-        currentDevice = nil
+        currentConfiguration = nil
 
         do {
             try process.run()
@@ -250,6 +304,7 @@ actor UniMERNetService {
 
         do {
             try await waitForStartupReady()
+            currentConfiguration = configuration
         } catch {
             shutdownWorker()
             throw error
@@ -332,10 +387,6 @@ actor UniMERNetService {
     private func handleWorkerResponse(_ response: WorkerResponse) {
         switch response.type {
         case "ready":
-            if let device = response.device.flatMap(WorkerDevice.init(rawValue:)) {
-                currentDevice = device
-            }
-
             let result: Result<Void, Error>
             if response.ok {
                 result = .success(())
@@ -398,7 +449,7 @@ actor UniMERNetService {
         process = nil
         standardInput = nil
         stdoutBuffer.removeAll(keepingCapacity: true)
-        currentDevice = nil
+        currentConfiguration = nil
         queuedStartupResult = nil
 
         if let startupContinuation {
@@ -428,6 +479,7 @@ actor UniMERNetService {
         standardInput = nil
         stdoutBuffer.removeAll(keepingCapacity: true)
         queuedStartupResult = nil
+        currentConfiguration = nil
 
         if let startupContinuation {
             self.startupContinuation = nil
@@ -441,16 +493,18 @@ actor UniMERNetService {
         }
     }
 
-    private func bootstrapRuntime() throws -> BootstrapState {
-        if let bootstrapState,
-           fileManager.isExecutableFile(atPath: bootstrapState.pythonURL.path),
-           fileManager.fileExists(atPath: bootstrapState.modelDirectoryURL.path) {
-            return bootstrapState
+    private func bootstrapRuntime(for variant: ModelVariant) throws -> BootstrapState {
+        if let state = bootstrapStates[variant],
+           fileManager.isExecutableFile(atPath: state.pythonURL.path),
+           fileManager.fileExists(atPath: state.modelDirectoryURL.path) {
+            return state
         }
 
         guard fileManager.fileExists(atPath: paths.bootstrapURL.path) else {
             throw UniMERNetServiceError.bootstrapScriptMissing(paths.bootstrapURL)
         }
+
+        try fileManager.createDirectory(at: paths.appSupportURL, withIntermediateDirectories: true)
 
         let bootstrapPython = try locateBootstrapPython()
         let result = try runProcess(
@@ -459,9 +513,11 @@ actor UniMERNetService {
                 "-u",
                 paths.bootstrapURL.path,
                 "--app-support-dir",
-                paths.appSupportURL.path
+                paths.appSupportURL.path,
+                "--model",
+                variant.rawValue
             ],
-            currentDirectoryURL: paths.projectRootURL
+            currentDirectoryURL: paths.appSupportURL
         )
 
         if result.stderr.isEmpty == false {
@@ -499,36 +555,50 @@ actor UniMERNetService {
             pythonURL: URL(fileURLWithPath: response.pythonPath),
             modelDirectoryURL: URL(fileURLWithPath: response.modelDir)
         )
-        bootstrapState = state
+        bootstrapStates[variant] = state
         return state
     }
 
-    private func shouldRetryOnCPU(afterStartup error: Error) -> Bool {
-        guard didFallbackToCPU == false else { return false }
+    private func fallbackConfigurations(after configuration: WorkerConfiguration) -> [WorkerConfiguration] {
+        let startupPlans = Self.startupPlans(
+            environment: ProcessInfo.processInfo.environment,
+            physicalMemory: ProcessInfo.processInfo.physicalMemory
+        )
 
-        switch error {
-        case UniMERNetServiceError.pythonMissing,
-             UniMERNetServiceError.bootstrapScriptMissing,
-             UniMERNetServiceError.workerMissing,
-             UniMERNetServiceError.bootstrapFailed:
-            return false
-        default:
-            return true
+        guard let currentIndex = startupPlans.firstIndex(of: configuration) else {
+            return availableStartupPlans()
         }
+
+        let remaining = Array(startupPlans.dropFirst(currentIndex + 1))
+        let filtered = remaining.filter { quarantinedDevices.contains($0.device) == false }
+        return filtered.isEmpty ? remaining : filtered
     }
 
-    private func shouldRetryOnCPU(after error: Error) -> Bool {
-        guard didFallbackToCPU == false else { return false }
-        guard currentDevice == .mps else { return false }
-        guard hasSuccessfulInference == false else { return false }
+    private func availableStartupPlans() -> [WorkerConfiguration] {
+        let startupPlans = Self.startupPlans(
+            environment: ProcessInfo.processInfo.environment,
+            physicalMemory: ProcessInfo.processInfo.physicalMemory
+        )
+        let filtered = startupPlans.filter { quarantinedDevices.contains($0.device) == false }
+        return filtered.isEmpty ? startupPlans : filtered
+    }
 
-        switch error {
-        case UniMERNetServiceError.recognitionFailed,
-             UniMERNetServiceError.malformedWorkerReply:
+    private func shouldAttemptFallback(after error: Error, from configuration: WorkerConfiguration) -> Bool {
+        if configuration.device == .mps {
             return true
-        default:
-            return false
         }
+
+        return hasSuccessfulInference == false
+    }
+
+    private func quarantineDevice(_ device: WorkerDevice, reason: String) async {
+        guard device == .mps else { return }
+        guard quarantinedDevices.insert(device).inserted else { return }
+
+        await logInternal(
+            "device_quarantined[\(device.rawValue)]: \(reason)",
+            to: paths.bootstrapLogURL
+        )
     }
 
     private func sanitize(_ error: Error) -> Error {
@@ -539,33 +609,147 @@ actor UniMERNetService {
         return UniMERNetServiceError.recognitionFailed(details: error.localizedDescription)
     }
 
-    nonisolated private static func preferredStartupDevice(environment: [String: String]) -> WorkerDevice {
-        switch environment["QUICKCALC_UNIMERNET_DEVICE"]?.lowercased() {
-        case WorkerDevice.mps.rawValue:
-            return .mps
-        case WorkerDevice.cpu.rawValue:
-            return .cpu
-        default:
-            // MPS currently fails reliably for this model on this machine.
-            return .cpu
+    nonisolated private static func startupPlans(
+        environment: [String: String],
+        physicalMemory: UInt64
+    ) -> [WorkerConfiguration] {
+        let variants = preferredModelVariants(environment: environment, physicalMemory: physicalMemory)
+        let devices = preferredDevices(environment: environment)
+
+        return variants.flatMap { variant in
+            devices.map { device in
+                WorkerConfiguration(variant: variant, device: device)
+            }
         }
+    }
+
+    nonisolated private static func preferredModelVariants(
+        environment: [String: String],
+        physicalMemory: UInt64
+    ) -> [ModelVariant] {
+        if let override = environment["QUICKCALC_UNIMERNET_MODEL"]?.lowercased(),
+           let variant = ModelVariant(rawValue: override) {
+            return [variant]
+        }
+
+        let memoryInGiB = Double(physicalMemory) / 1_073_741_824
+        if memoryInGiB < 8 {
+            return [.tiny, .small, .base]
+        }
+
+        if memoryInGiB < 16 {
+            return [.small, .base, .tiny]
+        }
+
+        return [.base, .small, .tiny]
+    }
+
+    nonisolated private static func preferredDevices(environment: [String: String]) -> [WorkerDevice] {
+        preferredDevices(environment: environment, supportsMPS: systemSupportsMPS())
+    }
+
+    nonisolated private static func preferredDevices(
+        environment: [String: String],
+        supportsMPS: Bool
+    ) -> [WorkerDevice] {
+        if let override = environment["QUICKCALC_UNIMERNET_DEVICE"]?.lowercased(),
+           let device = WorkerDevice(rawValue: override) {
+            switch device {
+            case .cpu:
+                return [.cpu]
+            case .mps:
+                return supportsMPS ? [.mps, .cpu] : [.cpu]
+            }
+        }
+
+        return [.cpu]
+    }
+
+    nonisolated private static func systemSupportsMPS() -> Bool {
+        #if arch(arm64)
+        true
+        #else
+        false
+        #endif
     }
 
     private func locateBootstrapPython() throws -> URL {
         let environment = ProcessInfo.processInfo.environment
-        let candidatePaths = [
+        let pathDirectories = (environment["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+            .split(separator: ":")
+            .map(String.init)
+
+        let explicitCandidates = [
+            environment["QUICKCALC_PYTHON"],
+            environment["QUICKCALC_PYTHON3"],
+            environment["QUICKCALC_PYTHON312"],
             environment["QUICKCALC_PYTHON311"],
-            "/opt/homebrew/bin/python3.11",
-            "/usr/local/bin/python3.11",
-            "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11",
-            "/usr/bin/python3.11"
+            environment["QUICKCALC_PYTHON310"]
         ].compactMap { $0 }
 
-        if let path = candidatePaths.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
-            return URL(fileURLWithPath: path)
+        let pathCandidates = pathDirectories.flatMap { directory in
+            ["python3.12", "python3.11", "python3.10", "python3"].map { "\(directory)/\($0)" }
+        }
+
+        let commonCandidates = [
+            "/opt/homebrew/bin/python3.12",
+            "/opt/homebrew/bin/python3.11",
+            "/opt/homebrew/bin/python3.10",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3.12",
+            "/usr/local/bin/python3.11",
+            "/usr/local/bin/python3.10",
+            "/usr/local/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12",
+            "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11",
+            "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10",
+            "/usr/bin/python3"
+        ]
+
+        var uniquePaths = Set<String>()
+        var supportedCandidates: [(url: URL, version: PythonVersion)] = []
+
+        for path in explicitCandidates + pathCandidates + commonCandidates {
+            guard uniquePaths.insert(path).inserted else { continue }
+            guard fileManager.isExecutableFile(atPath: path) else { continue }
+
+            let url = URL(fileURLWithPath: path)
+            guard let version = try? pythonVersion(at: url), version.isSupported else {
+                continue
+            }
+
+            supportedCandidates.append((url: url, version: version))
+        }
+
+        if let selected = supportedCandidates.max(by: { $0.version < $1.version }) {
+            return selected.url
         }
 
         throw UniMERNetServiceError.pythonMissing(nil)
+    }
+
+    private func pythonVersion(at executableURL: URL) throws -> PythonVersion {
+        let result = try runProcess(
+            executableURL: executableURL,
+            arguments: [
+                "-c",
+                "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"
+            ],
+            currentDirectoryURL: paths.appSupportURL
+        )
+
+        guard result.terminationStatus == 0 else {
+            throw UniMERNetServiceError.pythonMissing(executableURL)
+        }
+
+        let versionText = String(decoding: result.stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let components = versionText.split(separator: ".").compactMap { Int($0) }
+        guard components.count == 3 else {
+            throw UniMERNetServiceError.pythonMissing(executableURL)
+        }
+
+        return PythonVersion(major: components[0], minor: components[1], patch: components[2])
     }
 
     private func runProcess(
@@ -612,10 +796,16 @@ actor UniMERNetService {
     private var paths: UniMERNetPaths {
         UniMERNetPaths()
     }
+
+    nonisolated static func preferredDeviceNamesForTesting(
+        environment: [String: String],
+        supportsMPS: Bool
+    ) -> [String] {
+        preferredDevices(environment: environment, supportsMPS: supportsMPS).map(\.rawValue)
+    }
 }
 
 private struct UniMERNetPaths {
-    let projectRootURL: URL
     let appSupportURL: URL
     let logsURL: URL
     let bootstrapURL: URL
@@ -626,10 +816,10 @@ private struct UniMERNetPaths {
     let stdoutLogURL: URL
 
     nonisolated init() {
+        let fileManager = FileManager.default
         let sourceFileURL = URL(fileURLWithPath: #filePath)
         let sourceRootURL = sourceFileURL.deletingLastPathComponent()
-        let projectRootURL = sourceRootURL.deletingLastPathComponent()
-        let applicationSupportBaseURL = FileManager.default.urls(
+        let applicationSupportBaseURL = fileManager.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -637,9 +827,18 @@ private struct UniMERNetPaths {
         let appSupportURL = applicationSupportBaseURL
             .appendingPathComponent("QuickCalc", isDirectory: true)
         let logsURL = appSupportURL.appendingPathComponent("logs", isDirectory: true)
-        let supportURL = projectRootURL.appendingPathComponent("QuickCalcSupport", isDirectory: true)
 
-        self.projectRootURL = projectRootURL
+        let supportCandidates = [
+            Bundle.main.resourceURL,
+            Bundle.main.resourceURL?.appendingPathComponent("UniMERNetSupport", isDirectory: true),
+            sourceRootURL.appendingPathComponent("UniMERNetSupport", isDirectory: true)
+        ].compactMap { $0 }
+
+        let supportURL = supportCandidates.first(where: {
+            fileManager.fileExists(atPath: $0.appendingPathComponent("unimernet_bootstrap.py").path)
+                && fileManager.fileExists(atPath: $0.appendingPathComponent("unimernet_worker.py").path)
+        }) ?? sourceRootURL.appendingPathComponent("UniMERNetSupport", isDirectory: true)
+
         self.appSupportURL = appSupportURL
         self.logsURL = logsURL
         self.bootstrapURL = supportURL.appendingPathComponent("unimernet_bootstrap.py")

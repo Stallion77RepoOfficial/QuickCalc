@@ -11,11 +11,44 @@ import Foundation
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published private(set) var menuBarTitle = ""
-    @Published private(set) var lastExpression = ""
-    @Published private(set) var lastResult = ""
-    @Published private(set) var errorMessage: String?
-    @Published private(set) var isProcessing = false
+    struct StatusPresentation: Equatable {
+        enum Content: Equatable {
+            case empty
+            case loading
+            case error(String)
+            case result(expression: String, value: String)
+        }
+
+        let menuBarTitle: String
+        let lastExpression: String
+        let lastResult: String
+        let errorMessage: String?
+        let isProcessing: Bool
+
+        var content: Content {
+            if let errorMessage, !errorMessage.isEmpty {
+                return .error(errorMessage)
+            }
+
+            if !lastResult.isEmpty {
+                return .result(expression: lastExpression, value: lastResult)
+            }
+
+            if isProcessing {
+                return .loading
+            }
+
+            return .empty
+        }
+    }
+
+    @Published private(set) var statusPresentation = StatusPresentation(
+        menuBarTitle: "",
+        lastExpression: "",
+        lastResult: "",
+        errorMessage: nil,
+        isProcessing: false
+    )
 
     var showPopoverAction: (() -> Void)?
     var closeCanvasAction: (() -> Void)?
@@ -23,29 +56,45 @@ final class AppModel: ObservableObject {
     private let recognizer = HandwritingRecognizer()
 
     func processDrawing(strokes: [Stroke], canvasSize: CGSize) async {
-        guard !isProcessing else { return }
-        isProcessing = true
-        menuBarTitle = "..."
+        guard statusPresentation.isProcessing == false else { return }
+        applyStatus(
+            menuBarTitle: "...",
+            lastExpression: "",
+            lastResult: "",
+            errorMessage: nil,
+            isProcessing: true
+        )
+
+        var resolvedExpression = ""
 
         do {
             let expression = try await recognizer.recognizeExpression(from: strokes, canvasSize: canvasSize)
-            lastExpression = expression
+            resolvedExpression = expression
 
             let value = try ExpressionEvaluator.evaluate(expression)
             let formatted = ExpressionEvaluator.format(value)
 
-            lastResult = formatted
-            errorMessage = nil
-            menuBarTitle = Self.statusItemTitle(for: formatted)
+            applyStatus(
+                menuBarTitle: Self.statusItemTitle(for: formatted),
+                lastExpression: expression,
+                lastResult: formatted,
+                errorMessage: nil,
+                isProcessing: false
+            )
         } catch {
-            lastResult = ""
-            errorMessage = Self.userFacingMessage(for: error)
-            menuBarTitle = "!"
+            applyStatus(
+                menuBarTitle: "!",
+                lastExpression: resolvedExpression,
+                lastResult: "",
+                errorMessage: Self.userFacingMessage(for: error),
+                isProcessing: false
+            )
         }
 
-        isProcessing = false
         closeCanvasAction?()
-        showPopoverAction?()
+        DispatchQueue.main.async { [weak self] in
+            self?.showPopoverAction?()
+        }
     }
 
     nonisolated static func userFacingMessage(for error: Error) -> String {
@@ -67,5 +116,21 @@ final class AppModel: ObservableObject {
         let maxLength = 8
         guard text.count > maxLength else { return text }
         return "\(text.prefix(maxLength))…"
+    }
+
+    private func applyStatus(
+        menuBarTitle: String,
+        lastExpression: String,
+        lastResult: String,
+        errorMessage: String?,
+        isProcessing: Bool
+    ) {
+        statusPresentation = StatusPresentation(
+            menuBarTitle: menuBarTitle,
+            lastExpression: lastExpression,
+            lastResult: lastResult,
+            errorMessage: errorMessage,
+            isProcessing: isProcessing
+        )
     }
 }

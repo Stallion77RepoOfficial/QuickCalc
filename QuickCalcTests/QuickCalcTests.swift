@@ -84,19 +84,74 @@ struct QuickCalcTests {
         #expect(roundedXPositions == [0, 10, 20, 30, 35])
     }
 
-    @Test func normalizesUniMERNetInlineOperators() {
-        let normalized = HandwritingRecognizer.normalizedUniMERNetOutputForTesting("5 { + } 8")
-        #expect(normalized == "5+8")
+    @Test func normalizesWrappedAndUnicodeOperators() {
+        let cases = [
+            ("1 { + } 2", "1+2"),
+            ("1 { - } 2", "1-2"),
+            ("1 × 2", "1*2"),
+            ("1 ÷ 2", "1/2"),
+            ("1＋2", "1+2"),
+            ("1−2", "1-2")
+        ]
+
+        for (raw, expected) in cases {
+            let normalized = HandwritingRecognizer.normalizedUniMERNetOutputForTesting(raw)
+            #expect(normalized == expected)
+        }
     }
 
     @Test func normalizesUniMERNetFractionsIntoArithmetic() {
-        let normalized = HandwritingRecognizer.normalizedUniMERNetOutputForTesting("\\frac{12}{3}+4")
-        #expect(normalized == "(12)/(3)+4")
+        let normalized = HandwritingRecognizer.normalizedUniMERNetOutputForTesting("\\frac{12}{2}+1")
+        #expect(normalized == "(12)/(2)+1")
     }
 
-    @Test func trimsTrailingEqualsFromUniMERNetOutput() {
-        let normalized = HandwritingRecognizer.normalizedUniMERNetOutputForTesting("5+8=")
-        #expect(normalized == "5+8")
+    @Test func trimsTrailingEqualsAcrossSupportedOperators() {
+        let cases = [
+            ("1+2=", "1+2"),
+            ("12-1=", "12-1"),
+            ("12×2=", "12*2"),
+            ("12÷2＝", "12/2")
+        ]
+
+        for (raw, expected) in cases {
+            let normalized = HandwritingRecognizer.normalizedUniMERNetOutputForTesting(raw)
+            #expect(normalized == expected)
+        }
+    }
+
+    @Test func insertsImplicitMultiplicationForJuxtaposedGroups() {
+        let normalized = HandwritingRecognizer.normalizedUniMERNetOutputForTesting("(1)(2+1)")
+        #expect(normalized == "(1)*(2+1)")
+    }
+
+    @Test func preservesOperatorsWhileMergingSeparatedDigits() {
+        let cases = [
+            ("1 2+1 2", "12+12"),
+            ("1\n2-1\n2", "12-12"),
+            ("1 2×1 2", "12*12"),
+            ("1\n2÷1 2", "12/12"),
+            ("1 2 1+2", "121+2"),
+            ("1\n2\n2-1", "122-1")
+        ]
+
+        for (raw, expected) in cases {
+            let normalized = HandwritingRecognizer.normalizedUniMERNetOutputForTesting(raw)
+            #expect(normalized == expected)
+        }
+    }
+
+    @Test func rejectsLetterToDigitAndOperatorGuessing() {
+        let rejectedInputs = [
+            "1s2",
+            "1x2",
+            "12x1",
+            "1q2"
+        ]
+
+        for raw in rejectedInputs {
+            let normalized = HandwritingRecognizer.normalizedUniMERNetOutputForTesting(raw)
+            #expect(normalized.isEmpty)
+        }
     }
 
     @Test func mapsCanvasCoordinatesIntoUprightRecognitionImage() {
@@ -122,6 +177,73 @@ struct QuickCalcTests {
         #expect(message == "The AI model could not be started.")
         #expect(message.contains("CustomVision") == false)
         #expect(message.contains("VariableUniMerNetModel") == false)
+    }
+
+    @Test func defaultsToCpuForUniMERNetEvenWhenMPSSupported() {
+        let devices = UniMERNetService.preferredDeviceNamesForTesting(
+            environment: [:],
+            supportsMPS: true
+        )
+
+        #expect(devices == ["cpu"])
+    }
+
+    @Test func explicitMPSOverrideStillKeepsCpuFallback() {
+        let devices = UniMERNetService.preferredDeviceNamesForTesting(
+            environment: ["QUICKCALC_UNIMERNET_DEVICE": "mps"],
+            supportsMPS: true
+        )
+
+        #expect(devices == ["mps", "cpu"])
+    }
+
+    @Test func impossibleMPSOverrideFallsBackToCpu() {
+        let devices = UniMERNetService.preferredDeviceNamesForTesting(
+            environment: ["QUICKCALC_UNIMERNET_DEVICE": "mps"],
+            supportsMPS: false
+        )
+
+        #expect(devices == ["cpu"])
+    }
+
+    @Test func statusPresentationPrefersResolvedResultOverLoading() {
+        let presentation = AppModel.StatusPresentation(
+            menuBarTitle: "80",
+            lastExpression: "8*10",
+            lastResult: "80",
+            errorMessage: nil,
+            isProcessing: true
+        )
+
+        #expect(
+            presentation.content == .result(expression: "8*10", value: "80")
+        )
+    }
+
+    @Test func statusPresentationPrefersErrorOverLoading() {
+        let presentation = AppModel.StatusPresentation(
+            menuBarTitle: "!",
+            lastExpression: "",
+            lastResult: "",
+            errorMessage: "Handwriting could not be read.",
+            isProcessing: true
+        )
+
+        #expect(
+            presentation.content == .error("Handwriting could not be read.")
+        )
+    }
+
+    @Test func statusPresentationShowsLoadingOnlyWhenNoResolvedContentExists() {
+        let presentation = AppModel.StatusPresentation(
+            menuBarTitle: "...",
+            lastExpression: "",
+            lastResult: "",
+            errorMessage: nil,
+            isProcessing: true
+        )
+
+        #expect(presentation.content == .loading)
     }
 
     @MainActor

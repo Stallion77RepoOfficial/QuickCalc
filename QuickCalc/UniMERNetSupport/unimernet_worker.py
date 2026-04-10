@@ -89,7 +89,6 @@ def serve(model_dir: Path, device_name: str, log_file: Path) -> int:
             {
                 "type": "ready",
                 "ok": True,
-                "device": device_name,
             }
         )
     except Exception:
@@ -120,7 +119,6 @@ def serve(model_dir: Path, device_name: str, log_file: Path) -> int:
                     "id": request_id,
                     "ok": True,
                     "latex": latex,
-                    "device": device_name,
                 }
             )
         except Exception:
@@ -132,7 +130,6 @@ def serve(model_dir: Path, device_name: str, log_file: Path) -> int:
                     "id": request.get("id") if "request" in locals() else None,
                     "ok": False,
                     "error_code": "inference_failed",
-                    "device": device_name,
                 }
             )
 
