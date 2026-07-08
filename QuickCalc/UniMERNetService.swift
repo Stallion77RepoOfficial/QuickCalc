@@ -14,7 +14,6 @@ enum UniMERNetServiceError: LocalizedError {
     case bootstrapFailed(details: String?)
     case workerStartupFailed(details: String?)
     case recognitionFailed(details: String?)
-    case malformedWorkerReply
 
     var errorDescription: String? {
         switch self {
@@ -28,7 +27,7 @@ enum UniMERNetServiceError: LocalizedError {
             return "The AI model could not be prepared."
         case .workerStartupFailed:
             return "The AI model could not be started."
-        case .recognitionFailed, .malformedWorkerReply:
+        case .recognitionFailed:
             return "Handwriting could not be read."
         }
     }
@@ -93,6 +92,7 @@ actor UniMERNetService {
 
     private struct PendingRequest {
         let continuation: CheckedContinuation<String, Error>
+        let timeoutTask: Task<Void, Never>
     }
 
     private struct BootstrapState {
@@ -118,7 +118,7 @@ actor UniMERNetService {
         }
 
         var isSupported: Bool {
-            major == 3 && minor >= 10
+            major == 3 && (10...12).contains(minor)
         }
     }
 
@@ -348,12 +348,16 @@ actor UniMERNetService {
         encoded.append(0x0A)
 
         return try await withCheckedThrowingContinuation { continuation in
-            pending[requestID] = PendingRequest(continuation: continuation)
+            let timeoutTask = Task { [requestID] in
+                try? await Task.sleep(nanoseconds: 45_000_000_000)
+                self.handleRequestTimeout(id: requestID)
+            }
+            pending[requestID] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask)
 
             do {
                 try standardInput.write(contentsOf: encoded)
             } catch {
-                pending.removeValue(forKey: requestID)
+                pending.removeValue(forKey: requestID)?.timeoutTask.cancel()
                 continuation.resume(
                     throwing: UniMERNetServiceError.recognitionFailed(details: error.localizedDescription)
                 )
@@ -407,6 +411,7 @@ actor UniMERNetService {
             guard let id = response.id, let pendingRequest = pending.removeValue(forKey: id) else {
                 return
             }
+            pendingRequest.timeoutTask.cancel()
 
             if response.ok, let latex = response.latex {
                 pendingRequest.continuation.resume(returning: latex)
@@ -439,6 +444,14 @@ actor UniMERNetService {
         shutdownWorker()
     }
 
+    private func handleRequestTimeout(id: String) {
+        guard let request = pending.removeValue(forKey: id) else { return }
+        request.continuation.resume(
+            throwing: UniMERNetServiceError.recognitionFailed(details: "timeout")
+        )
+        shutdownWorker()
+    }
+
     private func handleTermination(status: Int32) {
         let startupContinuation = startupContinuation
         self.startupContinuation = nil
@@ -459,6 +472,7 @@ actor UniMERNetService {
         }
 
         for request in requests.values {
+            request.timeoutTask.cancel()
             request.continuation.resume(
                 throwing: UniMERNetServiceError.recognitionFailed(details: "terminated_\(status)")
             )
@@ -489,6 +503,7 @@ actor UniMERNetService {
         let requests = pending
         pending.removeAll()
         for request in requests.values {
+            request.timeoutTask.cancel()
             request.continuation.resume(throwing: UniMERNetServiceError.recognitionFailed(details: "interrupted"))
         }
     }

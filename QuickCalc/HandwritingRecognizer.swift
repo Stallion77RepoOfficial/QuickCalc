@@ -80,29 +80,24 @@ struct HandwritingRecognizer {
     }
 
     private static func uniMERNetCandidates(from images: [CGImage]) async throws -> [ExpressionCandidate] {
-        var candidates: [ExpressionCandidate] = []
         var firstError: Error?
 
         for (index, image) in images.enumerated() {
             do {
                 let rawOutput = try await recognizeWithUniMERNet(image)
-                candidates.append(
-                    contentsOf: ExpressionSanitizer.candidates(
-                        from: rawOutput,
-                        baseScore: 1_000 - (index * 25),
-                        source: "unimernet"
-                    )
+                let imageCandidates = ExpressionSanitizer.candidates(
+                    from: rawOutput,
+                    baseScore: 1_000 - (index * 25),
+                    source: "unimernet"
                 )
+                if imageCandidates.isEmpty == false {
+                    return ExpressionSanitizer.uniqueCandidates(imageCandidates)
+                }
             } catch {
                 if firstError == nil {
                     firstError = error
                 }
             }
-        }
-
-        let unique = ExpressionSanitizer.uniqueCandidates(candidates)
-        if unique.isEmpty == false {
-            return unique
         }
 
         if let firstError {

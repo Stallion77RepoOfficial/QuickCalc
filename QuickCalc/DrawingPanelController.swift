@@ -13,12 +13,14 @@ final class DrawingPanelController {
     private let model: AppModel
     private let canvasController = CanvasController()
     private lazy var panel: DrawingPanel = makePanel()
+    private var drawingGeneration = 0
 
     init(model: AppModel) {
         self.model = model
     }
 
     func show() {
+        drawingGeneration += 1
         canvasController.clear()
         panel.setFrame(panelFrame(), display: false)
         NSApp.activate(ignoringOtherApps: true)
@@ -30,6 +32,7 @@ final class DrawingPanelController {
     }
 
     func close() {
+        drawingGeneration += 1
         panel.orderOut(nil)
         canvasController.clear()
     }
@@ -53,13 +56,16 @@ final class DrawingPanelController {
             canvasController: canvasController,
             onIdle: { [weak self] strokes, canvasSize in
                 guard let self else { return }
+                let generation = self.drawingGeneration
                 self.canvasController.isRecognizing = true
 
                 Task { [weak self] in
                     guard let self else { return }
                     await self.model.processDrawing(strokes: strokes, canvasSize: canvasSize)
                     await MainActor.run {
-                        self.canvasController.isRecognizing = false
+                        if self.drawingGeneration == generation {
+                            self.canvasController.isRecognizing = false
+                        }
                     }
                 }
             },

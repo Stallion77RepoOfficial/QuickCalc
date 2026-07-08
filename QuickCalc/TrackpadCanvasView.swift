@@ -43,7 +43,6 @@ final class TrackpadCanvasNSView: NSView {
 
     private var cursorSession = CursorStrokeSession()
     private var idleWorkItem: DispatchWorkItem?
-    private var hasActiveTouches = false
     private var isPointerPressed = false
 
     override init(frame frameRect: NSRect) {
@@ -119,7 +118,6 @@ final class TrackpadCanvasNSView: NSView {
     func clear() {
         idleWorkItem?.cancel()
         cursorSession.clear()
-        hasActiveTouches = false
         isPointerPressed = false
         needsDisplay = true
     }
@@ -129,11 +127,11 @@ final class TrackpadCanvasNSView: NSView {
     }
 
     private func refreshTouchState(from event: NSEvent) {
-        hasActiveTouches = !event.touches(matching: .touching, in: self).isEmpty
+        isPointerPressed = !event.touches(matching: .touching, in: self).isEmpty
     }
 
     private var isDrawingAllowed: Bool {
-        isPointerPressed && hasActiveTouches
+        isPointerPressed
     }
 
     private func beginDrawingIfNeeded(timestamp: TimeInterval) {
